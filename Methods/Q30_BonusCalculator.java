@@ -1,1 +1,0 @@
-public class Q30_BonusCalculator {}
