@@ -1,0 +1,287 @@
+import java.time.*;
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.function.*;
+import java.util.stream.*;
+
+public class SmartCityApp {
+    public static void main(String[] args) {
+        List<TransportService> services = Arrays.asList(
+                new BusService("City Bus"),
+                new MetroService("Metro Line A"),
+                new TaxiService("QuickCab"),
+                new AmbulanceService("Emergency Ambulance"),
+                new FerryService("River Ferry")
+        );
+
+        List<Passenger> passengers = Arrays.asList(
+                new Passenger("P1"), new Passenger("P2"), new Passenger("P3"), new Passenger("P4"), new Passenger("P5")
+        );
+
+        FareCalculator fareCalculator = (base, distance, surge) -> base + distance * 2.5 * surge;
+
+        Point a = new Point(28.6139, 77.2090);
+        Point b = new Point(28.4595, 77.0266);
+        double distance = GeoUtils.calculateDistance(a, b);
+
+        Dashboard dashboard = new Dashboard();
+
+        Map<String, List<Schedule>> live = services.stream()
+                .collect(Collectors.toMap(TransportService::getName, TransportService::getLiveSchedules));
+
+        dashboard.displayServices(services);
+
+        Passenger bookingPassenger = passengers.get(0);
+        BookingEngine bookingEngine = new BookingEngine();
+
+        List<Offering> offers = bookingEngine.findOffers(services, o -> true, Comparator
+                .comparing(Offering::getDeparture)
+                .thenComparing(Offering::getFare));
+
+        Offering chosen = offers.stream().findFirst().orElseThrow(RuntimeException::new);
+
+        double fare = fareCalculator.calculateFare(chosen.getBaseFare(), distance, chosen.isPeak() ? 1.3 : 1.0);
+
+        TripRecord record = new TripRecord(bookingPassenger.getId(), chosen.getServiceName(), chosen.getRouteId(), fare, chosen.isPeak());
+
+        List<TripRecord> dayTrips = new ArrayList<>();
+        dayTrips.add(record);
+
+        Random r = new Random(42);
+        IntStream.range(0, 40).forEach(i -> {
+            Offering any = offers.get(r.nextInt(offers.size()));
+            double f = fareCalculator.calculateFare(any.getBaseFare(), 5 + r.nextInt(20), any.isPeak() ? 1.2 : 1.0);
+            dayTrips.add(new TripRecord("P" + (i + 6), any.getServiceName(), any.getRouteId(), f, any.isPeak()));
+        });
+
+        RevenueReporter reporter = new RevenueReporter();
+        RevenueReport rep = reporter.generate(dayTrips);
+
+        System.out.println("\nTop Routes by Trips:");
+        rep.getTopRoutesByTrips(3).forEach(System.out::println);
+
+        System.out.println("\nPeak vs Non-Peak Count:" );
+        rep.getPeakPartition().forEach((k,v) -> System.out.println((k?"Peak":"Non-Peak") + ": " + v.size()));
+
+        System.out.println("\nFare Summary:");
+        System.out.println(rep.getFareStats());
+
+        System.out.println("\nEmergency Prioritization Queue:");
+        PriorityQueue<TransportService> pq = new PriorityQueue<>(
+                Comparator.comparing((TransportService s) -> !(s instanceof EmergencyService))
+                        .thenComparing(TransportService::getName)
+        );
+        pq.addAll(services);
+        while(!pq.isEmpty()) System.out.println(pq.poll().getName());
+
+        System.out.println("\nService Details:");
+        services.forEach(TransportService::printServiceDetails);
+    }
+}
+
+interface TransportService {
+    String getName();
+    List<Schedule> getLiveSchedules();
+    default void printServiceDetails() {
+        System.out.println(getName() + " | Active Schedules: " + getLiveSchedules().size());
+    }
+}
+
+interface GeoUtils {
+    static double calculateDistance(Point p1, Point p2) {
+        double R = 6371.0;
+        double dLat = Math.toRadians(p2.lat - p1.lat);
+        double dLon = Math.toRadians(p2.lon - p1.lon);
+        double a = Math.sin(dLat/2) * Math.sin(dLat/2) +
+                Math.cos(Math.toRadians(p1.lat)) * Math.cos(Math.toRadians(p2.lat)) *
+                        Math.sin(dLon/2) * Math.sin(dLon/2);
+        double c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+        return R * c;
+    }
+}
+
+@FunctionalInterface
+interface FareCalculator {
+    double calculateFare(double base, double distance, double surge);
+}
+
+interface EmergencyService {}
+
+final class Point {
+    final double lat;
+    final double lon;
+    Point(double lat, double lon) { this.lat = lat; this.lon = lon; }
+}
+
+final class Schedule {
+    private final String routeId;
+    private final LocalDateTime departure;
+    private final double baseFare;
+    private final boolean peak;
+    Schedule(String routeId, LocalDateTime departure, double baseFare, boolean peak) {
+        this.routeId = routeId;
+        this.departure = departure;
+        this.baseFare = baseFare;
+        this.peak = peak;
+    }
+    String getRouteId() { return routeId; }
+    LocalDateTime getDeparture() { return departure; }
+    double getBaseFare() { return baseFare; }
+    boolean isPeak() { return peak; }
+}
+
+final class Offering {
+    private final String serviceName;
+    private final String routeId;
+    private final LocalDateTime departure;
+    private final double baseFare;
+    private final boolean peak;
+    Offering(String serviceName, String routeId, LocalDateTime departure, double baseFare, boolean peak) {
+        this.serviceName = serviceName;
+        this.routeId = routeId;
+        this.departure = departure;
+        this.baseFare = baseFare;
+        this.peak = peak;
+    }
+    String getServiceName() { return serviceName; }
+    String getRouteId() { return routeId; }
+    LocalDateTime getDeparture() { return departure; }
+    double getBaseFare() { return baseFare; }
+    boolean isPeak() { return peak; }
+    double getFare() { return baseFare; }
+}
+
+abstract class BaseService implements TransportService {
+    private final String name;
+    private final List<Schedule> schedules;
+    BaseService(String name, List<Schedule> schedules) {
+        this.name = name;
+        this.schedules = schedules;
+    }
+    public String getName() { return name; }
+    public List<Schedule> getLiveSchedules() { return schedules; }
+}
+
+final class BusService extends BaseService {
+    BusService(String name) { super(name, sample("B")); }
+    private static List<Schedule> sample(String prefix) {
+        return Arrays.asList(
+                new Schedule(prefix+"-101", LocalDateTime.now().plusMinutes(10), 15, true),
+                new Schedule(prefix+"-102", LocalDateTime.now().plusMinutes(25), 12, false),
+                new Schedule(prefix+"-103", LocalDateTime.now().plusMinutes(5), 18, true)
+        );
+    }
+}
+
+final class MetroService extends BaseService {
+    MetroService(String name) { super(name, sample("M")); }
+    private static List<Schedule> sample(String prefix) {
+        return Arrays.asList(
+                new Schedule(prefix+"-21", LocalDateTime.now().plusMinutes(3), 25, true),
+                new Schedule(prefix+"-22", LocalDateTime.now().plusMinutes(15), 20, false)
+        );
+    }
+}
+
+final class TaxiService extends BaseService {
+    TaxiService(String name) { super(name, sample("T")); }
+    private static List<Schedule> sample(String prefix) {
+        return Arrays.asList(
+                new Schedule(prefix+"-XA", LocalDateTime.now().plusMinutes(2), 50, true),
+                new Schedule(prefix+"-XB", LocalDateTime.now().plusMinutes(12), 40, false)
+        );
+    }
+}
+
+final class FerryService extends BaseService {
+    FerryService(String name) { super(name, sample("F")); }
+    private static List<Schedule> sample(String prefix) {
+        return Arrays.asList(
+                new Schedule(prefix+"-R1", LocalDateTime.now().plusMinutes(30), 30, false),
+                new Schedule(prefix+"-R2", LocalDateTime.now().plusMinutes(50), 28, false)
+        );
+    }
+}
+
+final class AmbulanceService extends BaseService implements EmergencyService {
+    AmbulanceService(String name) { super(name, sample("E")); }
+    private static List<Schedule> sample(String prefix) {
+        return Arrays.asList(
+                new Schedule(prefix+"-EM1", LocalDateTime.now(), 0, true)
+        );
+    }
+}
+
+final class Passenger {
+    private final String id;
+    Passenger(String id) { this.id = id; }
+    String getId() { return id; }
+}
+
+final class BookingEngine {
+    List<Offering> findOffers(List<TransportService> services, Predicate<Offering> filter, Comparator<Offering> sorter) {
+        return services.stream()
+                .flatMap(s -> s.getLiveSchedules().stream().map(sc -> new Offering(s.getName(), sc.getRouteId(), sc.getDeparture(), sc.getBaseFare(), sc.isPeak())))
+                .filter(filter)
+                .sorted(sorter)
+                .collect(Collectors.toList());
+    }
+}
+
+final class Dashboard {
+    void displayServices(List<TransportService> services) {
+        services.forEach(s -> s.getLiveSchedules().forEach(sc -> System.out.println(
+                s.getName() + " | " + sc.getRouteId() + " | Dep: " + sc.getDeparture() + " | Base: " + sc.getBaseFare() + (sc.isPeak()?" | Peak":"")
+        )));
+    }
+}
+
+final class TripRecord {
+    private final String passengerId;
+    private final String serviceName;
+    private final String routeId;
+    private final double fare;
+    private final boolean peak;
+    TripRecord(String passengerId, String serviceName, String routeId, double fare, boolean peak) {
+        this.passengerId = passengerId;
+        this.serviceName = serviceName;
+        this.routeId = routeId;
+        this.fare = fare;
+        this.peak = peak;
+    }
+    String getPassengerId() { return passengerId; }
+    String getServiceName() { return serviceName; }
+    String getRouteId() { return routeId; }
+    double getFare() { return fare; }
+    boolean isPeak() { return peak; }
+}
+
+final class RevenueReport {
+    private final Map<String, List<TripRecord>> byRoute;
+    private final Map<Boolean, List<TripRecord>> peakPartition;
+    private final DoubleSummaryStatistics fareStats;
+    RevenueReport(Map<String, List<TripRecord>> byRoute, Map<Boolean, List<TripRecord>> peakPartition, DoubleSummaryStatistics fareStats) {
+        this.byRoute = byRoute;
+        this.peakPartition = peakPartition;
+        this.fareStats = fareStats;
+    }
+    Map<String, List<TripRecord>> getByRoute() { return byRoute; }
+    Map<Boolean, List<TripRecord>> getPeakPartition() { return peakPartition; }
+    DoubleSummaryStatistics getFareStats() { return fareStats; }
+    List<String> getTopRoutesByTrips(int k) {
+        return byRoute.entrySet().stream()
+                .sorted(Comparator.comparingInt((Map.Entry<String, List<TripRecord>> e) -> e.getValue().size()).reversed())
+                .limit(k)
+                .map(e -> e.getKey() + " => trips: " + e.getValue().size())
+                .collect(Collectors.toList());
+    }
+}
+
+final class RevenueReporter {
+    RevenueReport generate(List<TripRecord> records) {
+        Map<String, List<TripRecord>> byRoute = records.stream().collect(Collectors.groupingBy(TripRecord::getRouteId));
+        Map<Boolean, List<TripRecord>> peakPartition = records.stream().collect(Collectors.partitioningBy(TripRecord::isPeak));
+        DoubleSummaryStatistics fareStats = records.stream().collect(Collectors.summarizingDouble(TripRecord::getFare));
+        return new RevenueReport(byRoute, peakPartition, fareStats);
+    }
+}
